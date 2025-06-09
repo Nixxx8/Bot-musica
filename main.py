@@ -21,9 +21,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Configuración de audio
 FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn -c:a libopus -b:a 128k -ar 48000 -ac 2',
-}
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 32M -analyzeduration 32M',
+    'options': '-vn -c:a libopus -b:a 128k -ar 48000 -ac 2 -af "dynaudnorm=g=12:f=150,acompressor=threshold=0.5:ratio=2:attack=20:release=250"',
+    'executable': 'ffmpeg',
+}   
 
 # --------------------------
 # Sistema de Colas
@@ -382,6 +383,91 @@ async def nowplaying(ctx):
             )
             await ctx.send(embed=embed)
 
+
+
+
+# --------------------------
+# Comandos de Información
+# --------------------------
+
+@bot.command(name="changelog")
+async def changelog(ctx):
+    """Muestra los últimos cambios en el bot"""
+    embed = discord.Embed(
+        title="🎉 Changelog - Actualización Estética del Bot de Música 🎶",
+        description="Aquí están los últimos cambios realizados en el bot:",
+        color=discord.Color.gold()
+    )
+    
+    embed.add_field(
+        name="📅 Fecha de la Actualización",
+        value=ctx.message.created_at.strftime("%Y-%m-%d"),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="✨ Versión",
+        value='2.0 - "Mensajes con Estilo"',
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🌟 Novedades Principales",
+        value="""
+**🎨 Interfaz Mejorada**
+🔹 Todos los mensajes ahora usan Embeds de Discord con colores temáticos
+🔹 Miniaturas de canciones integradas
+🔹 Enlaces clickeables a los videos de YouTube
+
+**📢 Mensajes Más Claros y Detallados**
+🔸 Procesamiento en tiempo real
+🔸 Información enriquecida (duración, solicitante, estado de cola)
+🔸 Errores más descriptivos
+""",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🛠️ Cambios Técnicos",
+        value="""
+🔧 Optimización de código
+🔧 Mejoras en la respuesta de voz
+""",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="📜 Lista de Comandos Actualizados",
+        value="""
+`!play` - Ahora muestra miniatura, duración y posición en cola
+`!skip` - Mensaje de confirmación con estilo
+`!queue` - Lista formateada con enlaces y detalles
+`!nowplaying` - Muestra portada del video y más metadata
+""",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🐛 Correcciones de Bugs",
+        value="""
+- Arreglado problema con errores poco claros
+- Mejor manejo de desconexiones inesperadas
+""",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🎁 Agradecimientos",
+        value="¡Gracias por usar el bot! Esperamos que esta actualización haga la experiencia más agradable.",
+        inline=False
+    )
+    
+    embed.set_footer(text="¡Disfruta de la música con estilo! 🎧✨")
+    
+    await ctx.send(embed=embed)
+
+
+
 # --------------------------
 # Eventos
 # --------------------------
@@ -399,7 +485,7 @@ async def on_ready():
     print(f"✅ Bot listo como {bot.user}")
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.listening,
-        name="rolitas 🎵🎵"
+        name="!help"
     ))
 
 # --------------------------
