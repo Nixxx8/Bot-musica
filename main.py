@@ -8,6 +8,9 @@ import asyncio
 import traceback
 import random
 import json
+import sqlite3
+from yt_dlp import YoutubeDL
+
 
 # --------------------------
 # Configuración Inicial
@@ -100,107 +103,41 @@ class MusicPlayer:
 
 
 
-PLAYLISTS_FILE = "playlists.json"
-
-try:
-    with open(PLAYLISTS_FILE, "r", encoding="utf-8") as f:
-        playlists = json.load(f)
-except FileNotFoundError:
-    playlists = {}
-
-@bot.command(name="savepl")
-async def save_playlist(ctx, *, nombre: str):
-    guild_id = str(ctx.guild.id)
-
-    # Clonar objetos para evitar conflictos con el reproductor
-    queue = [c.copy() for c in music_queue.get_queue(ctx.guild.id)]
-    current = music_queue.current.get(ctx.guild.id)
-    canciones = [current.copy()] if current else []
-    canciones.extend(queue)
-
-    if not canciones:
-        return await ctx.send("❌ No hay música en reproducción ni en cola para guardar.")
-
-    if guild_id not in playlists:
-        playlists[guild_id] = {}
-    playlists[guild_id][nombre] = canciones
-
-    try:
-        # Guardar en archivo sin afectar reproducción
-        with open(PLAYLISTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(playlists, f, ensure_ascii=False, indent=4)
-
-        await ctx.send(f"✅ Playlist **{nombre}** guardada con {len(canciones)} canciones.")
-
-    except Exception as e:
-        return await ctx.send(f"❌ Error al guardar la playlist: `{e}`")
-
-    except Exception as e:
-        return await ctx.send(f"❌ Error al guardar la playlist: `{e}`")
-
-
-@bot.command(name="loadpl")
-async def load_playlist(ctx, *, nombre: str):
-    guild_id = str(ctx.guild.id)
-    if guild_id not in playlists or nombre not in playlists[guild_id]:
-        return await ctx.send("❌ No se encontró esa playlist.")
-
-    lista = playlists[guild_id][nombre]
-    if not isinstance(lista, list):
-        return await ctx.send("❌ La playlist está corrupta o vacía.")
-
-    queue = music_queue.get_queue(ctx.guild.id)
-    queue.extend([c.copy() for c in lista])
-
-    await ctx.send(f"📂 Playlist **{nombre}** cargada con {len(lista)} canciones.")
-
-    voice_client = ctx.voice_client or await ctx.author.voice.channel.connect()
-    queue = music_queue.get_queue(ctx.guild.id)
-
-    # Solo iniciar reproducción si no está sonando nada y hay canciones en cola
-    if not voice_client.is_playing() and not music_queue.get_playing(ctx.guild.id) and queue:
-        await play_next(ctx.guild.id)
-
-
-@bot.command(name="listpl")
-async def list_playlists(ctx):
-    guild_id = str(ctx.guild.id)
-    if guild_id not in playlists or not playlists[guild_id]:
-        return await ctx.send("📭 No hay playlists guardadas en este servidor.")
-
-    nombres = list(playlists[guild_id].keys())
-    embed = discord.Embed(
-        title="📂 Playlists disponibles",
-        description="\n".join(f"• {n}" for n in nombres),
-        color=discord.Color.blue()
-    )
-    await ctx.send(embed=embed)
-
-@bot.command(name="delpl")
-async def delete_playlist(ctx, nombre: str):
-    guild_id = str(ctx.guild.id)
-    if guild_id in playlists and nombre in playlists[guild_id]:
-        del playlists[guild_id][nombre]
-        with open(PLAYLISTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(playlists, f, ensure_ascii=False, indent=4)
-        await ctx.send(f"🗑️ Playlist **{nombre}** eliminada.")
-    else:
-        await ctx.send("❌ Esa playlist no existe.")
+# Inicializar conexión SQLite
+conn = sqlite3.connect("playlists.db")
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS playlists (
+    guild_id TEXT,
+    name TEXT,
+    songs TEXT,
+    PRIMARY KEY (guild_id, name)
+)
+""")
+conn.commit()
 
 @bot.command(name="renamepl")
-async def rename_playlist(ctx, nombre_actual: str, nuevo_nombre: str):
+async def rename_playlist(ctx, *, argumentos: str):
+    try:
+        nombre_actual, nuevo_nombre = map(str.strip, argumentos.split("|", 1))
+    except ValueError:
+        return await ctx.send("❌ Formato incorrecto. Usa: `!renamepl nombre_actual | nuevo_nombre`")
+
     guild_id = str(ctx.guild.id)
-    if guild_id not in playlists or nombre_actual not in playlists[guild_id]:
+    cursor.execute("SELECT songs FROM playlists WHERE guild_id = ? AND name = ?", (guild_id, nombre_actual))
+    resultado = cursor.fetchone()
+
+    if not resultado:
         return await ctx.send("❌ No se encontró esa playlist para renombrar.")
 
-    if nuevo_nombre in playlists[guild_id]:
+    cursor.execute("SELECT 1 FROM playlists WHERE guild_id = ? AND name = ?", (guild_id, nuevo_nombre))
+    if cursor.fetchone():
         return await ctx.send("⚠️ Ya existe una playlist con ese nombre.")
 
     try:
-        playlists[guild_id][nuevo_nombre] = playlists[guild_id].pop(nombre_actual)
-
-        with open(PLAYLISTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(playlists, f, ensure_ascii=False, indent=4)
+        cursor.execute("DELETE FROM playlists WHERE guild_id = ? AND name = ?", (guild_id, nombre_actual))
+        cursor.execute("INSERT INTO playlists (guild_id, name, songs) VALUES (?, ?, ?)", (guild_id, nuevo_nombre, resultado[0]))
+        conn.commit()
 
         embed = discord.Embed(
             title="✏️ Playlist renombrada",
@@ -210,12 +147,205 @@ async def rename_playlist(ctx, nombre_actual: str, nuevo_nombre: str):
         await ctx.send(embed=embed)
 
     except Exception as e:
-        error_embed = discord.Embed(
+        await ctx.send(embed=discord.Embed(
             title="❌ Error al renombrar",
             description=f"Ocurrió un error al renombrar la playlist: `{e}`",
             color=discord.Color.red()
-        )
-        await ctx.send(embed=error_embed)
+        ))
+
+@bot.command(name="savepl")
+async def save_playlist(ctx, *, nombre: str):
+    guild_id = str(ctx.guild.id)
+    queue = [c.copy() for c in music_queue.get_queue(ctx.guild.id)]
+    current = music_queue.current.get(ctx.guild.id)
+    canciones = [current.copy()] if current else []
+    canciones.extend(queue)
+
+    if not canciones:
+        return await ctx.send("❌ No hay música en reproducción ni en cola para guardar.")
+
+    canciones_serializadas = json.dumps(canciones, ensure_ascii=False)
+
+    try:
+        cursor.execute("REPLACE INTO playlists (guild_id, name, songs) VALUES (?, ?, ?)", (guild_id, nombre, canciones_serializadas))
+        conn.commit()
+        await ctx.send(f"✅ Playlist **{nombre}** guardada con {len(canciones)} canciones.")
+    except Exception as e:
+        return await ctx.send(f"❌ Error al guardar la playlist: `{e}`")
+
+@bot.command(name="loadpl")
+async def load_playlist(ctx, *, nombre: str):
+    guild_id = str(ctx.guild.id)
+    cursor.execute("SELECT songs FROM playlists WHERE guild_id = ? AND name = ?", (guild_id, nombre))
+    resultado = cursor.fetchone()
+
+    if not resultado:
+        return await ctx.send("❌ No se encontró esa playlist.")
+
+    try:
+        lista = json.loads(resultado[0])
+    except Exception as e:
+        return await ctx.send("❌ La playlist está corrupta o vacía.")
+
+    queue = music_queue.get_queue(ctx.guild.id)
+    queue.extend([c.copy() for c in lista])
+
+    await ctx.send(f"📂 Playlist **{nombre}** cargada con {len(lista)} canciones.")
+
+    voice_client = ctx.voice_client or await ctx.author.voice.channel.connect()
+    if not voice_client.is_playing() and not music_queue.get_playing(ctx.guild.id) and queue:
+        await play_next(ctx.guild.id)
+
+@bot.command(name="listpl")
+async def listar_playlists(ctx):
+    guild_id = str(ctx.guild.id)
+    cursor.execute("SELECT name FROM playlists WHERE guild_id = ?", (guild_id,))
+    resultados = cursor.fetchall()
+
+    if not resultados:
+        return await ctx.send("📭 No hay playlists guardadas.")
+
+    nombres = [f"- {r[0]}" for r in resultados]
+    mensaje = "🎶 **Playlists guardadas:**\n" + "\n".join(nombres)
+    await ctx.send(mensaje)
+
+@bot.command(name="delpl")
+async def eliminar_playlist(ctx, *, nombre: str):
+    guild_id = str(ctx.guild.id)
+    cursor.execute("SELECT 1 FROM playlists WHERE guild_id = ? AND name = ?", (guild_id, nombre))
+    if not cursor.fetchone():
+        return await ctx.send("❌ No se encontró esa playlist para eliminar.")
+
+    try:
+        cursor.execute("DELETE FROM playlists WHERE guild_id = ? AND name = ?", (guild_id, nombre))
+        conn.commit()
+        await ctx.send(f"🗑️ Playlist **{nombre}** eliminada correctamente.")
+    except Exception as e:
+        return await ctx.send(f"❌ Error al eliminar la playlist: `{e}`")
+
+@bot.command(name="editpl")
+async def editar_playlist(ctx):
+    guild_id = str(ctx.guild.id)
+
+    # Obtener todas las playlists disponibles
+    cursor.execute("SELECT name FROM playlists WHERE guild_id = ?", (guild_id,))
+    listas = cursor.fetchall()
+
+    if not listas:
+        return await ctx.send("📭 No hay playlists guardadas para editar.")
+
+    opciones = [r[0] for r in listas]
+    lista_str = "\n".join([f"{i+1}. {n}" for i, n in enumerate(opciones)])
+
+    await ctx.send(f"📚 **Playlists disponibles:**\n{lista_str}\n\nResponde con el número de la playlist que deseas editar:")
+
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel and m.content.isdigit()
+
+    try:
+        msg = await bot.wait_for("message", timeout=30.0, check=check)
+        index = int(msg.content) - 1
+        if index < 0 or index >= len(opciones):
+            return await ctx.send("❌ Número inválido.")
+        nombre = opciones[index]
+    except asyncio.TimeoutError:
+        return await ctx.send("⌛ Tiempo agotado.")
+
+    cursor.execute("SELECT songs FROM playlists WHERE guild_id = ? AND name = ?", (guild_id, nombre))
+    resultado = cursor.fetchone()
+    canciones = json.loads(resultado[0]) if resultado else []
+
+    embed = discord.Embed(
+        title=f"🛠 Editar Playlist: {nombre}",
+        description="Selecciona una opción:",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name="1️⃣ Ver canciones", value="Lista todas las canciones.", inline=False)
+    embed.add_field(name="2️⃣ Eliminar canción", value="Elimina una canción por número.", inline=False)
+    embed.add_field(name="3️⃣ Agregar desde la cola", value="Agrega todas las canciones en cola.", inline=False)
+    embed.add_field(name="4️⃣ Agregar por URL", value="Agrega una canción por URL.", inline=False)
+    embed.add_field(name="5️⃣ Cancelar", value="Cancelar la edición.", inline=False)
+
+    message = await ctx.send(embed=embed)
+    botones = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+    for emoji in botones:
+        await message.add_reaction(emoji)
+
+    def check_reaction(reaction, user):
+        return user == ctx.author and reaction.message.id == message.id and str(reaction.emoji) in botones
+
+    try:
+        reaction, _ = await bot.wait_for("reaction_add", timeout=60.0, check=check_reaction)
+    except asyncio.TimeoutError:
+        return await ctx.send("⌛ Tiempo agotado.")
+
+    emoji = str(reaction.emoji)
+
+    if emoji == "1️⃣":
+        if not canciones:
+            return await ctx.send("🎵 Esta playlist está vacía.")
+        lista = "\n".join([f"{i+1}. {c['title']}" for i, c in enumerate(canciones)])
+        return await ctx.send(f"🎼 **Canciones en {nombre}:**\n{lista}")
+
+    elif emoji == "2️⃣":
+        if not canciones:
+            return await ctx.send("🎵 Esta playlist está vacía.")
+        lista = "\n".join([f"{i+1}. {c['title']}" for i, c in enumerate(canciones)])
+        await ctx.send(f"🎯 ¿Qué canción deseas eliminar?\n{lista}\nResponde con un número del 1 al {len(canciones)}:")
+
+        def check_msg(m):
+            return m.author == ctx.author and m.channel == ctx.channel and m.content.isdigit()
+
+        try:
+            msg = await bot.wait_for("message", timeout=30.0, check=check_msg)
+            index = int(msg.content) - 1
+            if 0 <= index < len(canciones):
+                eliminada = canciones.pop(index)
+                canciones_serializadas = json.dumps(canciones, ensure_ascii=False)
+                cursor.execute("UPDATE playlists SET songs = ? WHERE guild_id = ? AND name = ?", (canciones_serializadas, guild_id, nombre))
+                conn.commit()
+                await ctx.send(f"🗑️ Canción **{eliminada['title']}** eliminada.")
+            else:
+                await ctx.send("⚠️ Número fuera de rango.")
+        except asyncio.TimeoutError:
+            await ctx.send("⌛ Tiempo agotado.")
+
+    elif emoji == "3️⃣":
+        nuevas = [c.copy() for c in music_queue.get_queue(ctx.guild.id)]
+        if not nuevas:
+            return await ctx.send("❌ No hay canciones en cola.")
+        canciones.extend(nuevas)
+        canciones_serializadas = json.dumps(canciones, ensure_ascii=False)
+        cursor.execute("UPDATE playlists SET songs = ? WHERE guild_id = ? AND name = ?", (canciones_serializadas, guild_id, nombre))
+        conn.commit()
+        await ctx.send(f"➕ Se agregaron {len(nuevas)} canciones desde la cola.")
+
+    elif emoji == "4️⃣":
+        await ctx.send("📥 Envía el enlace de la canción que deseas agregar:")
+
+        def check_url(m):
+            return m.author == ctx.author and m.channel == ctx.channel
+
+        try:
+            msg = await bot.wait_for("message", timeout=45.0, check=check_url)
+            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                info = ydl.extract_info(msg.content, download=False)
+                cancion = {
+                    "title": info.get('title', 'Sin título'),
+                    "url": msg.content
+                }
+            canciones.append(cancion)
+            canciones_serializadas = json.dumps(canciones, ensure_ascii=False)
+            cursor.execute("UPDATE playlists SET songs = ? WHERE guild_id = ? AND name = ?", (canciones_serializadas, guild_id, nombre))
+            conn.commit()
+            await ctx.send(f"🎵 Canción **{cancion['title']}** agregada.")
+        except Exception as e:
+            await ctx.send(f"❌ Error al agregar canción: `{e}`")
+
+    elif emoji == "5️⃣":
+        await ctx.send("❎ Edición cancelada.")
+
+
 
 # --------------------------
 # Funciones de Reproducción
@@ -551,91 +681,117 @@ async def shuffle(ctx):
 # --------------------------
 
 @bot.command(name="changelog")
-async def changelog(ctx):
-    """Muestra los últimos cambios en el bot"""
+async def mostrar_changelog(ctx):
     embed = discord.Embed(
-        title="🎉 CHANGELOG v3.0 - EXPERIENCIA COMPLETA",
-        description="Aquí están las revolucionarias mejoras de esta versión:",
-        color=discord.Color.gold()
+    title="📜 Registro de Cambios Recientes",
+    description="Mejoras aplicadas recientemente al bot musical:",
+    color=discord.Color.green()
     )
-    
-    embed.add_field(
-        name="📅 Fecha de Lanzamiento",
-        value=ctx.message.created_at.strftime("%Y-%m-%d"),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="🎧 AUDIO PROFESIONAL",
-        value="""
-**🔊 Calidad de sonido mejorada**
-- Bitrate aumentado a 192k (calidad de streaming)
-- Normalización inteligente: `loudnorm=I=-16:TP=-1.5:LRA=11`
-- Compresor optimizado:
-  - Threshold: `-20dB` | Ratio: `4:1`
-  - Ataque/liberación suavizados: `attack=50`, `release=200`
 
-**🐛 Errores corregidos:**
-- Distorsión en frecuencias altas
-- Volumen inconsistente entre pistas
-""",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="🔄 FLUJO INTELIGENTE",
-        value="""
-**📌 Mensajes contextuales**
-- Notificaciones siempre en el canal origen
-- Sistema mejorado de rastreo de canales
+    if ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
 
-**🔀 Nuevo comando: `!shuffle`**
-- Mezcla profesional con algoritmo Fisher-Yates
-- Requiere 2+ canciones en cola
-- Confirmación con embed visual
+    if ctx.author.avatar:
+        embed.set_footer(text="Actualizado por el equipo del bot 🎧", icon_url=ctx.author.avatar.url)
+    else:
+        embed.set_footer(text="Actualizado por el equipo del bot 🎧")
 
-**📜 `!queue` rediseñado**
-- Todo en un solo embed sin paginación
-- Formato mejorado con duración y solicitante
-- Límite inteligente de 20 canciones visibles
-""",
+    # SISTEMA DE PLAYLISTS
+    embed.add_field(
+        name="🧠 Sistema de playlists mejorado",
+        value=(
+            "- Migración de JSON a SQLite\n"
+            "- Soporte para nombres con espacios\n"
+            "- Playlists por servidor\n"
+            "- Guardar, cargar y renombrar sin pausar la música"
+        ),
         inline=False
     )
-    
-    embed.add_field(
-        name="⚙️ OPTIMIZACIONES",
-        value="""
-**🛠️ Bajo el capó:**
-- Código más eficiente en gestión de colas
-- Sistema de errores mejorado
-- Mensajes más descriptivos
 
-**📌 Estado permanente:**
-- 🎧 Escuchando "Tus favoritas"
-""",
-        inline=False
-    )
-    
+    # EDITOR INTERACTIVO
     embed.add_field(
-        name="📌 EJEMPLOS PRÁCTICOS",
-        value="""
-```bash
-!play Bohemian Rhapsody
-!shuffle
-!queue
-```""",
+        name="🛠️ Nuevo comando `!editpl`",
+        value=(
+            "- Menú interactivo con reacciones\n"
+            "- Ver canciones con numeración\n"
+            "- Eliminar por número\n"
+            "- Agregar desde cola o URL"
+        ),
         inline=False
     )
-    
+
+    # MEJORAS VISUALES
     embed.add_field(
-        name="🎁 AGRADECIMIENTOS",
-        value="¡Gracias por hacer crecer esta comunidad musical! 🎶✨",
+        name="🎨 Estética y comandos agrupados",
+        value=(
+            "- `!comandos` rediseñado con secciones:\n"
+            "  🎵 Reproducción / 📁 Playlists / ⚙️ Utilidades\n"
+            "- Mejor uso de colores, emojis y descripciones"
+        ),
         inline=False
     )
-    
-    embed.set_footer(text="Bot de Música v3.0 | ¡Más que un bot, una experiencia!")
-    
+
+    # NUEVAS FUNCIONES
+    embed.add_field(
+        name="🎵 Nuevos comandos y mejoras",
+        value=(
+            "- `!shuffle`: mezcla la cola\n"
+            "- `!nowplaying` / `!np`: muestra canción actual\n"
+            "- `!changelog`: muestra este registro"
+        ),
+        inline=False
+    )
+
     await ctx.send(embed=embed)
+
+
+@bot.command(name="comandos")
+async def mostrar_comandos(ctx):
+    embed = discord.Embed(
+        title="🎶 Panel de Comandos del Bot Musical",
+        description="Aquí tienes una lista completa de los comandos disponibles, organizados por categoría:",
+        color=discord.Color.blurple()
+    )
+    embed.set_thumbnail(url=ctx.guild.icon.url if ctx.guild.icon else discord.Embed.Empty)
+    embed.set_footer(text="Disfruta la música 🎧", icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+
+    categorias = {
+        "🎵 Reproducción": [
+            ("!play <url o búsqueda>", "Reproduce una canción desde YouTube o Spotify."),
+            ("!pause", "Pausa la canción actual."),
+            ("!resume", "Reanuda la canción pausada."),
+            ("!skip", "Salta a la siguiente canción en la cola."),
+            ("!stop", "Detiene la reproducción y sale del canal de voz."),
+            ("!volume <1-100>", "Ajusta el volumen del bot."),
+            ("!queue", "Muestra la cola de reproducción actual."),
+            ("!shuffle", "Mezcla aleatoriamente el orden de las canciones en la cola."),
+            ("!nowplaying / !np", "Muestra información de la canción que se está reproduciendo actualmente."),
+        ],
+        "📁 Playlists": [
+            ("!savepl <nombre>", "Guarda la canción actual y la cola en una playlist."),
+            ("!loadpl <nombre>", "Carga una playlist guardada."),
+            ("!listpl", "Lista todas las playlists guardadas."),
+            ("!renamepl nombre_actual | nuevo_nombre", "Renombra una playlist."),
+            ("!delpl <nombre>", "Elimina una playlist."),
+            ("!editpl", "Editar una playlist con menú interactivo.")
+        ],
+        "⚙️ Utilidades": [
+            ("!comandos", "Muestra este mensaje."),
+            ("!changelog", "Muestra los últimos cambios realizados en el bot.")
+        ]
+    }
+
+    for categoria, comandos in categorias.items():
+        embed.add_field(name=categoria, value="​", inline=False)
+        for i, (cmd, desc) in enumerate(comandos, start=1):
+            embed.add_field(
+                name=f"`{cmd}`",
+                value=f"{desc}",
+                inline=False
+            )
+
+    await ctx.send(embed=embed)
+
 
 
 
