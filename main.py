@@ -10,7 +10,8 @@ import random
 import json
 import sqlite3
 from yt_dlp import YoutubeDL
-
+import platform
+import psutil
 
 # --------------------------
 # Configuración Inicial
@@ -26,10 +27,53 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Configuración de audio
 FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 32M -analyzeduration 32M',
-    'options': '-vn -c:a libopus -b:a 192k -ar 48000 -ac 2 -af "loudnorm=I=-16:TP=-1.5:LRA=11,acompressor=threshold=-20dB:ratio=4:attack=50:release=200"',
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 32M -analyzeduration 32M -fflags +discardcorrupt',
+    'options': '-vn -c:a libopus -b:a 192k -ar 48000 -ac 2 -af "loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=-16:measured_TP=-1.5:measured_LRA=11:measured_thresh=-30:offset=0,acompressor=threshold=-20dB:ratio=4:attack=50:release=200:makeup=3" -application lowdelay',
     'executable': 'ffmpeg',
 }
+
+# Configuración optimizada para yt-dlp
+def get_ydl_opts():
+    return {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'no_warnings': True,
+        'extractaudio': True,
+        'audioformat': 'opus',
+        'noplaylist': True,
+        'socket_timeout': 10,
+        'source_address': '0.0.0.0',
+        'retries': 3,
+        'extractor_args': {
+            'youtube': {
+                'skip': ['dash', 'hls'],
+                'player_client': ['android'],
+                'player_skip': ['configs', 'webpage']
+            }
+        },
+        'referer': 'https://www.youtube.com',
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'postprocessor_args': {
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'opus',
+            'preferredquality': '192'
+        }
+    }
+
+# Ajustar límites del sistema
+def increase_file_limits():
+    """Aumenta los límites de archivos abiertos si es posible"""
+    if platform.system() != 'Windows':
+        try:
+            import resource
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (8192, hard))
+        except (ImportError, ValueError, OSError) as e:
+            print(f"No se pudo ajustar límites de archivos: {e}")
+    else:
+        print("En Windows, los límites de archivos se manejan automáticamente")
+
+increase_file_limits()
 
 # --------------------------
 # Sistema de Colas
@@ -62,7 +106,6 @@ class MusicQueue:
         return self.is_playing.get(guild_id, False)
 
 music_queue = MusicQueue()
-
 # --------------------------
 # Clase del Reproductor
 # --------------------------
@@ -80,7 +123,9 @@ class MusicPlayer:
     @classmethod
     async def get_audio_source(cls, query: str) -> dict:
         try:
-            with yt_dlp.YoutubeDL(cls.YDL_OPTIONS) as ydl:
+            ydl_opts = get_ydl_opts()
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 if not query.startswith(('http://', 'https://')):
                     query = f"ytsearch:{query}"
                 
@@ -96,7 +141,7 @@ class MusicPlayer:
                     'thumbnail': info.get('thumbnail', 'https://i.imgur.com/8QZQZ.png'),
                     'requested_by': 'Solicitado'
                 }
-        except Exception:
+        except Exception as e:
             print(f"Error al obtener audio: {traceback.format_exc()}")
             return None
 
@@ -381,12 +426,10 @@ async def play_next(guild_id: int, error=None):
         
         voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(guild_id, e), bot.loop))
         
-        # Obtener el canal de texto donde se ejecutó el comando
         guild = bot.get_guild(guild_id)
         text_channel = next((channel for channel in guild.text_channels if channel.id == next_song.get('request_channel_id')), None)
         
         if text_channel:
-            # Crear embed para mostrar la canción actual
             embed = discord.Embed(
                 title="🎵 Reproduciendo ahora",
                 description=f"[{next_song['title']}]({next_song['url']})",
@@ -811,8 +854,8 @@ async def on_voice_state_update(member, before, after):
 async def on_ready():
     print(f"✅ Bot listo como {bot.user}")
     await bot.change_presence(activity=discord.Activity(
-    type=discord.ActivityType.listening,
-    name="Tus favoritas"
+    type=discord.ActivityType.playing,
+    name="!comandos"
 ))
 # --------------------------
 # Ejecución del Bot
