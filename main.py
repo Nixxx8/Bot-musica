@@ -8,16 +8,44 @@ import asyncio
 import traceback
 import random
 import json
-import sqlite3
 from yt_dlp import YoutubeDL
 import platform
 import psutil
+from pymongo import MongoClient
+import datetime
+
 
 # --------------------------
 # Configuración Inicial
 # --------------------------
 
-load_dotenv()
+# --------------------------
+# Configuración Inicial
+# --------------------------
+
+load_dotenv()  # Primero cargar variables de entorno
+
+MONGO_URI = os.getenv("MONGO_URI")
+if not MONGO_URI:
+    raise ValueError("No se encontró MONGO_URI en las variables de entorno")
+
+try:
+    mongo_client = MongoClient(MONGO_URI)
+    # Verificar conexión
+    mongo_client.admin.command('ping')
+    print("✅ Conexión a MongoDB establecida")
+    
+    db = mongo_client["discord_music_bot"]
+    playlists_collection = db["playlists"]
+    # Crear índice único para evitar duplicados
+    playlists_collection.create_index([("guild_id", 1), ("name", 1)], unique=True)
+    
+except Exception as e:
+    print(f"❌ Error al conectar a MongoDB: {e}")
+    raise
+
+# Resto del código...
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -134,8 +162,11 @@ class MusicPlayer:
                 if 'entries' in info:
                     info = info['entries'][0]
                 
+                youtube_url = f"https://youtu.be/{info['id']}" if 'id' in info else query
+                
                 return {
                     'url': info['url'],
+                    'youtube_url': youtube_url,
                     'title': info.get('title', 'Audio desconocido'),
                     'duration': info.get('duration', 0),
                     'thumbnail': info.get('thumbnail', 'https://i.imgur.com/8QZQZ.png'),
@@ -148,19 +179,6 @@ class MusicPlayer:
 
 
 
-# Inicializar conexión SQLite
-conn = sqlite3.connect("playlists.db")
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS playlists (
-    guild_id TEXT,
-    name TEXT,
-    songs TEXT,
-    PRIMARY KEY (guild_id, name)
-)
-""")
-conn.commit()
-
 @bot.command(name="renamepl")
 async def rename_playlist(ctx, *, argumentos: str):
     try:
@@ -169,34 +187,24 @@ async def rename_playlist(ctx, *, argumentos: str):
         return await ctx.send("❌ Formato incorrecto. Usa: `!renamepl nombre_actual | nuevo_nombre`")
 
     guild_id = str(ctx.guild.id)
-    cursor.execute("SELECT songs FROM playlists WHERE guild_id = ? AND name = ?", (guild_id, nombre_actual))
-    resultado = cursor.fetchone()
-
-    if not resultado:
+    playlist = playlists_collection.find_one({"guild_id": guild_id, "name": nombre_actual})
+    if not playlist:
         return await ctx.send("❌ No se encontró esa playlist para renombrar.")
 
-    cursor.execute("SELECT 1 FROM playlists WHERE guild_id = ? AND name = ?", (guild_id, nuevo_nombre))
-    if cursor.fetchone():
+    if playlists_collection.find_one({"guild_id": guild_id, "name": nuevo_nombre}):
         return await ctx.send("⚠️ Ya existe una playlist con ese nombre.")
 
-    try:
-        cursor.execute("DELETE FROM playlists WHERE guild_id = ? AND name = ?", (guild_id, nombre_actual))
-        cursor.execute("INSERT INTO playlists (guild_id, name, songs) VALUES (?, ?, ?)", (guild_id, nuevo_nombre, resultado[0]))
-        conn.commit()
+    playlists_collection.delete_one({"guild_id": guild_id, "name": nombre_actual})
+    playlist["name"] = nuevo_nombre
+    playlists_collection.insert_one(playlist)
 
-        embed = discord.Embed(
-            title="✏️ Playlist renombrada",
-            description=f"**{nombre_actual}** fue renombrada exitosamente a **{nuevo_nombre}**.",
-            color=discord.Color.green()
-        )
-        await ctx.send(embed=embed)
+    embed = discord.Embed(
+        title="✏️ Playlist renombrada",
+        description=f"**{nombre_actual}** fue renombrada exitosamente a **{nuevo_nombre}**.",
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed)
 
-    except Exception as e:
-        await ctx.send(embed=discord.Embed(
-            title="❌ Error al renombrar",
-            description=f"Ocurrió un error al renombrar la playlist: `{e}`",
-            color=discord.Color.red()
-        ))
 
 @bot.command(name="savepl")
 async def save_playlist(ctx, *, nombre: str):
@@ -209,11 +217,18 @@ async def save_playlist(ctx, *, nombre: str):
     if not canciones:
         return await ctx.send("❌ No hay música en reproducción ni en cola para guardar.")
 
-    canciones_serializadas = json.dumps(canciones, ensure_ascii=False)
-
     try:
-        cursor.execute("REPLACE INTO playlists (guild_id, name, songs) VALUES (?, ?, ?)", (guild_id, nombre, canciones_serializadas))
-        conn.commit()
+        playlists_collection.update_one(
+            {"guild_id": guild_id, "name": nombre},
+            {"$set": {
+                "guild_id": guild_id,
+                "name": nombre,
+                "songs": canciones,
+                "saved_at": datetime.datetime.utcnow(),
+                "saved_by": ctx.author.display_name
+            }},
+            upsert=True
+        )
         await ctx.send(f"✅ Playlist **{nombre}** guardada con {len(canciones)} canciones.")
     except Exception as e:
         return await ctx.send(f"❌ Error al guardar la playlist: `{e}`")
@@ -221,67 +236,82 @@ async def save_playlist(ctx, *, nombre: str):
 @bot.command(name="loadpl")
 async def load_playlist(ctx, *, nombre: str):
     guild_id = str(ctx.guild.id)
-    cursor.execute("SELECT songs FROM playlists WHERE guild_id = ? AND name = ?", (guild_id, nombre))
-    resultado = cursor.fetchone()
+    resultado = playlists_collection.find_one({"guild_id": guild_id, "name": nombre})
 
     if not resultado:
         return await ctx.send("❌ No se encontró esa playlist.")
 
-    try:
-        lista = json.loads(resultado[0])
-    except Exception as e:
-        return await ctx.send("❌ La playlist está corrupta o vacía.")
+    lista_guardada = resultado.get("songs", [])
+    if not lista_guardada:
+        return await ctx.send("ℹ️ La playlist está vacía.")
 
     queue = music_queue.get_queue(ctx.guild.id)
-    queue.extend([c.copy() for c in lista])
+    total = len(lista_guardada)
+    exitosas = 0
 
-    await ctx.send(f"📂 Playlist **{nombre}** cargada con {len(lista)} canciones.")
+    msg = await ctx.send(f"🔄 Cargando playlist ({total} canciones)...")
+
+    for cancion in lista_guardada:
+        try:
+            # Usar youtube_url si existe, si no usar title como búsqueda
+            query = cancion.get('youtube_url', cancion.get('title', ''))
+            if not query:
+                continue
+                
+            datos = await MusicPlayer.get_audio_source(query)
+            if datos:
+                # Preservar metadatos originales
+                datos.update({
+                    'requested_by': cancion.get('requested_by', ctx.author.display_name),
+                    'request_channel_id': ctx.channel.id,
+                    'duration': cancion.get('duration', datos.get('duration', 0)),
+                    'thumbnail': cancion.get('thumbnail', datos.get('thumbnail'))
+                })
+                queue.append(datos)
+                exitosas += 1
+        except Exception as e:
+            print(f"Error cargando canción: {e}")
+
+    await msg.edit(content=f"✅ {exitosas}/{total} canciones cargadas desde **{nombre}**.")
 
     voice_client = ctx.voice_client or await ctx.author.voice.channel.connect()
-    if not voice_client.is_playing() and not music_queue.get_playing(ctx.guild.id) and queue:
+    if not voice_client.is_playing() and queue:
         await play_next(ctx.guild.id)
-
-@bot.command(name="listpl")
-async def listar_playlists(ctx):
-    guild_id = str(ctx.guild.id)
-    cursor.execute("SELECT name FROM playlists WHERE guild_id = ?", (guild_id,))
-    resultados = cursor.fetchall()
-
-    if not resultados:
-        return await ctx.send("📭 No hay playlists guardadas.")
-
-    nombres = [f"- {r[0]}" for r in resultados]
-    mensaje = "🎶 **Playlists guardadas:**\n" + "\n".join(nombres)
-    await ctx.send(mensaje)
 
 @bot.command(name="delpl")
 async def eliminar_playlist(ctx, *, nombre: str):
     guild_id = str(ctx.guild.id)
-    cursor.execute("SELECT 1 FROM playlists WHERE guild_id = ? AND name = ?", (guild_id, nombre))
-    if not cursor.fetchone():
-        return await ctx.send("❌ No se encontró esa playlist para eliminar.")
+    resultado = playlists_collection.delete_one({"guild_id": guild_id, "name": nombre})
 
-    try:
-        cursor.execute("DELETE FROM playlists WHERE guild_id = ? AND name = ?", (guild_id, nombre))
-        conn.commit()
-        await ctx.send(f"🗑️ Playlist **{nombre}** eliminada correctamente.")
-    except Exception as e:
-        return await ctx.send(f"❌ Error al eliminar la playlist: `{e}`")
+    if resultado.deleted_count == 0:
+        return await ctx.send("❌ No se encontró esa playlist para eliminar.")
+    await ctx.send(f"🗑️ Playlist **{nombre}** eliminada correctamente.")
+
+@bot.command(name="listpl")
+async def listar_playlists(ctx):
+    guild_id = str(ctx.guild.id)
+    resultados = playlists_collection.find({"guild_id": guild_id})
+
+    nombres = [f"- {doc['name']}" for doc in resultados]
+    if not nombres:
+        return await ctx.send("📭 No hay playlists guardadas.")
+
+    mensaje = "🎶 **Playlists guardadas:**\n" + "\n".join(nombres)
+    await ctx.send(mensaje)
+
 
 @bot.command(name="editpl")
 async def editar_playlist(ctx):
     guild_id = str(ctx.guild.id)
 
     # Obtener todas las playlists disponibles
-    cursor.execute("SELECT name FROM playlists WHERE guild_id = ?", (guild_id,))
-    listas = cursor.fetchall()
+    listas = playlists_collection.find({"guild_id": guild_id})
+    opciones = [pl["name"] for pl in listas]
 
-    if not listas:
+    if not opciones:
         return await ctx.send("📭 No hay playlists guardadas para editar.")
 
-    opciones = [r[0] for r in listas]
     lista_str = "\n".join([f"{i+1}. {n}" for i, n in enumerate(opciones)])
-
     await ctx.send(f"📚 **Playlists disponibles:**\n{lista_str}\n\nResponde con el número de la playlist que deseas editar:")
 
     def check(m):
@@ -296,9 +326,8 @@ async def editar_playlist(ctx):
     except asyncio.TimeoutError:
         return await ctx.send("⌛ Tiempo agotado.")
 
-    cursor.execute("SELECT songs FROM playlists WHERE guild_id = ? AND name = ?", (guild_id, nombre))
-    resultado = cursor.fetchone()
-    canciones = json.loads(resultado[0]) if resultado else []
+    playlist = playlists_collection.find_one({"guild_id": guild_id, "name": nombre})
+    canciones = playlist.get("songs", [])
 
     embed = discord.Embed(
         title=f"🛠 Editar Playlist: {nombre}",
@@ -329,13 +358,13 @@ async def editar_playlist(ctx):
     if emoji == "1️⃣":
         if not canciones:
             return await ctx.send("🎵 Esta playlist está vacía.")
-        lista = "\n".join([f"{i+1}. {c['title']}" for i, c in enumerate(canciones)])
+        lista = "\n".join([f"{i+1}. {c.get('title', 'Sin título')}" for i, c in enumerate(canciones)])
         return await ctx.send(f"🎼 **Canciones en {nombre}:**\n{lista}")
 
     elif emoji == "2️⃣":
         if not canciones:
             return await ctx.send("🎵 Esta playlist está vacía.")
-        lista = "\n".join([f"{i+1}. {c['title']}" for i, c in enumerate(canciones)])
+        lista = "\n".join([f"{i+1}. {c.get('title', 'Sin título')}" for i, c in enumerate(canciones)])
         await ctx.send(f"🎯 ¿Qué canción deseas eliminar?\n{lista}\nResponde con un número del 1 al {len(canciones)}:")
 
         def check_msg(m):
@@ -346,10 +375,11 @@ async def editar_playlist(ctx):
             index = int(msg.content) - 1
             if 0 <= index < len(canciones):
                 eliminada = canciones.pop(index)
-                canciones_serializadas = json.dumps(canciones, ensure_ascii=False)
-                cursor.execute("UPDATE playlists SET songs = ? WHERE guild_id = ? AND name = ?", (canciones_serializadas, guild_id, nombre))
-                conn.commit()
-                await ctx.send(f"🗑️ Canción **{eliminada['title']}** eliminada.")
+                playlists_collection.update_one(
+                    {"guild_id": guild_id, "name": nombre},
+                    {"$set": {"songs": canciones}}
+                )
+                await ctx.send(f"🗑️ Canción **{eliminada.get('title', 'Sin título')}** eliminada.")
             else:
                 await ctx.send("⚠️ Número fuera de rango.")
         except asyncio.TimeoutError:
@@ -360,9 +390,10 @@ async def editar_playlist(ctx):
         if not nuevas:
             return await ctx.send("❌ No hay canciones en cola.")
         canciones.extend(nuevas)
-        canciones_serializadas = json.dumps(canciones, ensure_ascii=False)
-        cursor.execute("UPDATE playlists SET songs = ? WHERE guild_id = ? AND name = ?", (canciones_serializadas, guild_id, nombre))
-        conn.commit()
+        playlists_collection.update_one(
+            {"guild_id": guild_id, "name": nombre},
+            {"$set": {"songs": canciones}}
+        )
         await ctx.send(f"➕ Se agregaron {len(nuevas)} canciones desde la cola.")
 
     elif emoji == "4️⃣":
@@ -373,16 +404,19 @@ async def editar_playlist(ctx):
 
         try:
             msg = await bot.wait_for("message", timeout=45.0, check=check_url)
+            url = msg.content
+
             with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
-                info = ydl.extract_info(msg.content, download=False)
+                info = ydl.extract_info(url, download=False)
                 cancion = {
-                    "title": info.get('title', 'Sin título'),
-                    "url": msg.content
+                    "title": info.get("title", "Sin título"),
+                    "url": url
                 }
             canciones.append(cancion)
-            canciones_serializadas = json.dumps(canciones, ensure_ascii=False)
-            cursor.execute("UPDATE playlists SET songs = ? WHERE guild_id = ? AND name = ?", (canciones_serializadas, guild_id, nombre))
-            conn.commit()
+            playlists_collection.update_one(
+                {"guild_id": guild_id, "name": nombre},
+                {"$set": {"songs": canciones}}
+            )
             await ctx.send(f"🎵 Canción **{cancion['title']}** agregada.")
         except Exception as e:
             await ctx.send(f"❌ Error al agregar canción: `{e}`")
@@ -432,7 +466,7 @@ async def play_next(guild_id: int, error=None):
         if text_channel:
             embed = discord.Embed(
                 title="🎵 Reproduciendo ahora",
-                description=f"[{next_song['title']}]({next_song['url']})",
+                description=f"[{next_song['title']}]({next_song['youtube_url']})",
                 color=discord.Color.blurple()
             )
             embed.set_thumbnail(url=next_song.get('thumbnail', 'https://i.imgur.com/8QZQZ.png'))
@@ -491,7 +525,7 @@ async def play(ctx, *, query: str):
         # Crear embed de respuesta
         embed = discord.Embed(
             title="🎶 Canción añadida",
-            description=f"[{data['title']}]({data['url']})",
+            description=f"[{data['title']}]({data['youtube_url']})",
             color=discord.Color.green()
         )
         embed.set_thumbnail(url=data.get('thumbnail', 'https://i.imgur.com/8QZQZ.png'))
@@ -656,7 +690,7 @@ async def nowplaying(ctx):
         current_song = music_queue.current[ctx.guild.id]
         embed = discord.Embed(
             title="🎵 Reproduciendo ahora",
-            description=f"[{current_song['title']}]({current_song['url']})",
+            description=f"[{current_song['title']}]({current_song['youtube_url']})",
             color=discord.Color.blurple()
         )
         embed.set_thumbnail(url=current_song.get('thumbnail', 'https://i.imgur.com/8QZQZ.png'))
